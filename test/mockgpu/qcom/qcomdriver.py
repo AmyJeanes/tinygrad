@@ -1,7 +1,7 @@
 import ctypes, functools, mmap
 from tinygrad.runtime.autogen import kgsl, libc
 from test.mockgpu.driver import VirtDriver, VirtFileDesc, VirtFile
-from test.mockgpu.qcom.qcomgpu import QCOMGPU, METAL
+from test.mockgpu.qcom.qcomgpu import QCOMGPU, METAL, Mappings
 if METAL:  # gpu objects live in one Metal buffer, so a630 addresses are offsets into it
   from test.mockgpu.qcom import metal
   from tinygrad.runtime.support import system
@@ -33,7 +33,7 @@ class QCOMDriver(VirtDriver):
   def __init__(self):
     super().__init__()
     self.tracked_files += [VirtFile('/dev/kgsl-3d0', functools.partial(KGSLFileDesc, driver=self))]
-    self.mappings:dict[tuple[str, int], tuple[int, int]] = {}
+    self.mappings = Mappings()
     self.gpu, self.next_fd, self.next_id, self.timestamp = QCOMGPU(self.mappings), 1 << 30, 1, 0
 
   def open(self, name, flags, mode, virtfile):

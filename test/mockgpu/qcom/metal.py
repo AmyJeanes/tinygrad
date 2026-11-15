@@ -1,4 +1,4 @@
-import ctypes, functools, hashlib, math, os, struct, time
+import ctypes, ctypes.util, functools, hashlib, math, mmap, os, struct, time
 import numpy as np
 from tinygrad.helpers import getenv, to_mv, cache_dir
 from tinygrad.runtime.autogen import mesa
@@ -907,6 +907,8 @@ class Gen:
 
 # ***** Metal runtime
 
+_libc, MADV_FREE_REUSABLE, MADV_FREE_REUSE = ctypes.CDLL(ctypes.util.find_library("c")), 7, 8
+
 def _objc():
   import tinygrad.runtime.support.objc as objc
   from tinygrad.runtime.autogen import metal
@@ -920,8 +922,10 @@ class MetalQCOM:
     self.compiler = MetalCompiler()
     self.dev = metal.MTLCreateSystemDefaultDevice()
     self.queue = self.dev.newCommandQueueWithMaxCommandBufferCount(1024)
-    self.arena = self.dev.newBufferWithLength_options(arena_size, metal.MTLResourceStorageModeShared)
-    if self.arena.value is None: raise MemoryError(f"Metal could not allocate a {arena_size} byte arena")
+    self.arena_mem = mmap.mmap(-1, arena_size, mmap.MAP_PRIVATE | mmap.MAP_ANON)
+    self.nocopy = nocopy = objc.msg("newBufferWithBytesNoCopy:length:options:deallocator:", metal.MTLBuffer, [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_void_p])
+    self.arena = nocopy(self.dev, ctypes.addressof(ctypes.c_char.from_buffer(self.arena_mem)), arena_size, metal.MTLResourceStorageModeShared, None)
+    if self.arena.value is None: raise MemoryError(f"Metal could not wrap a {arena_size} byte arena")
     self.base, self.size = self.arena.contents(), arena_size
     self.free:list[tuple[int, int]] = [(0, arena_size)]
     self.used:dict[int, int] = {}
@@ -930,6 +934,9 @@ class MetalQCOM:
     self.tables:dict[str, object] = {}
     self.xbufs:dict[tuple[int, int], object] = {}
     self.xcache:dict[tuple, list] = {}
+    self.xranges:list|None = None
+    self.xout:list = []
+    self.xdata = bytes(32)
     self.cb = self.enc = None
     self.deferred:list[tuple[int, int]] = []  # signal writes held until the kernels queued before them finish
     self.inflight:list = []
@@ -938,6 +945,20 @@ class MetalQCOM:
     self.scratch_off = 0
     self.stats = {"metal": 0, "cpu": 0, "compile_s": 0.0}
     self.fallback_reasons:dict[str, int] = {}
+    self.scratch_ptr = self.scratch.contents()
+    send, P, L = objc.lib["objc_msgSend"], ctypes.c_void_p, ctypes.c_ulong
+    def fn(sel:str, *args):
+      f = ctypes.CFUNCTYPE(None, P, P, *args)(ctypes.cast(send, P).value)
+      s = objc.getsel(sel.encode()).value
+      return lambda enc, *a: f(enc, s, *a)
+    self.f_buffer = fn("setBuffer:offset:atIndex:", P, L, L)
+    self.f_offset = fn("setBufferOffset:atIndex:", L, L)
+    self.f_pso = fn("setComputePipelineState:", P)
+    self.f_dispatch = fn("dispatchThreadgroups:threadsPerThreadgroup:", metal.MTLSize, metal.MTLSize)
+    self.f_barrier = fn("memoryBarrierWithScope:", L)
+    self.f_use = fn("useResource:usage:", P, L)
+    self.est:dict = {}  # what the open encoder already has bound
+    self.dmemo:dict[int, tuple] = {}
 
   def alloc(self, size:int) -> int:
     size = (size + 0x3FFF) & ~0x3FFF
@@ -947,6 +968,7 @@ class MetalQCOM:
         self.used[off] = size
         self.high = max(self.high, off + size)
         self.sync()
+        _libc.madvise(ctypes.c_void_p(self.base + off), ctypes.c_size_t(size), MADV_FREE_REUSE)
         ctypes.memset(self.base + off, 0, size)
         return self.base + off
     raise MemoryError(f"qcom metal arena of {self.size} bytes is full (QCOM_METAL_ARENA)")
@@ -954,6 +976,7 @@ class MetalQCOM:
   def release(self, addr:int):
     off = addr - self.base
     size = self.used.pop(off)
+    _libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size), MADV_FREE_REUSABLE)  # hand the pages back: alloc zeroes them again
     self.free.append((off, size))
     self.free.sort()
     merged:list[tuple[int, int]] = []
@@ -964,11 +987,16 @@ class MetalQCOM:
 
   def table(self, name:str):
     if name not in self.tables:
-      t = sfu_table(name)
-      buf = self.dev.newBufferWithLength_options(t.nbytes, self.metal.MTLResourceStorageModeShared)
-      ctypes.memmove(buf.contents(), t.ctypes.data, t.nbytes)
-      self.tables[name] = buf
-    return self.tables[name]
+      path = os.path.join(cache_dir, "qcom_metal", f"{name}.bin")
+      if not os.path.exists(path):
+        t = sfu_table.__wrapped__(name).tobytes()
+        with open(path + ".tmp", "wb") as f: f.write(t + bytes(-len(t) % 0x4000))
+        os.replace(path + ".tmp", path)
+      with open(path, "rb") as f: mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY)
+      buf = self.nocopy(self.dev, ctypes.addressof(ctypes.c_char.from_buffer(mm)), len(mm), self.metal.MTLResourceStorageModeShared, None)
+      if buf.value is None: raise MemoryError(f"Metal could not wrap the {name} table")
+      self.tables[name] = (buf, mm)
+    return self.tables[name][0]
 
   def pipeline(self, key:tuple):
     if key in self.pipes: return self.pipes[key]
@@ -1000,7 +1028,15 @@ class MetalQCOM:
     n = (len(data) + 255) & ~255
     if self.scratch_off + n > 64 << 20: self.sync()
     off = self.scratch_off
-    ctypes.memmove(self.scratch.contents() + off, data, len(data))
+    ctypes.memmove(self.scratch_ptr + off, data, len(data))
+    self.scratch_off += n
+    return off
+
+  def upload_ptr(self, ptr:int, nbytes:int) -> int:
+    n = (nbytes + 255) & ~255
+    if self.scratch_off + n > 64 << 20: self.sync()
+    off = self.scratch_off
+    ctypes.memmove(self.scratch_ptr + off, ptr, nbytes)
     self.scratch_off += n
     return off
 
@@ -1008,6 +1044,10 @@ class MetalQCOM:
     if self.enc is None:
       self.cb = self.queue.commandBuffer()
       self.enc = self.cb.computeCommandEncoder()
+      self.est = {"tables": set(), "used": set()}
+      e = self.enc.value
+      self.f_buffer(e, self.arena.value, 0, 0)
+      for i in (1, 2, 3): self.f_buffer(e, self.scratch.value, 0, i)
     return self.enc
 
   def flush(self):  # starts the queued kernels without waiting, so the gpu runs while the cp keeps encoding
@@ -1029,8 +1069,12 @@ class MetalQCOM:
     self.deferred.clear()
 
   def xmaps(self, d:emu.Dispatch) -> list[tuple[int, int, object]]:
+    if d.ranges is self.xranges: return self.xout  # qcomgpu hands the same list until the mappings change
     key = tuple(d.ranges)
-    if (hit := self.xcache.get(key)) is not None: return hit
+    if (hit := self.xcache.get(key)) is not None:
+      self.xranges, self.xout = d.ranges, hit
+      self.xdata = b"".join(struct.pack("QQQQ", lo, hi, buf.gpuAddress() + (lo - blo), 0) for lo, hi, buf, blo in hit) or bytes(32)
+      return hit
     out = []
     for st, sz in d.ranges:
       if self.owns(st): continue
@@ -1042,53 +1086,58 @@ class MetalQCOM:
         if buf.value is None: raise Unsupported(f"could not wrap host memory {st:#x}")
         self.xbufs[(lo, hi)] = buf
       out.append((st, st + sz, self.xbufs[(lo, hi)], lo))
-    self.xcache = {key: out}
+    self.xcache, self.xranges, self.xout = {key: out}, d.ranges, out
+    self.xdata = b"".join(struct.pack("QQQQ", lo, hi, buf.gpuAddress() + (lo - blo), 0) for lo, hi, buf, blo in out) or bytes(32)
     return out
 
-  def run(self, d:emu.Dispatch) -> bool:  # False: the caller runs it on the cpu emulator
+  def prepare(self, d:emu.Dispatch) -> str|tuple:
     key = (d.image, d.entry, d.merged, d.demote, d.localid_reg, d.wgid_reg, d.lmem_size, d.pvt_size, tuple(t.dtype for t in d.textures),
            tuple(t.dtype for t in d.ibos), False)
     p = self.pipeline(key)
-    reason = None
-    if isinstance(p, Unsupported): reason = str(p)
-    else:
-      pso, tables, maxt, _, samps, imbuf = p
-      nloc = math.prod(d.local_size)
-      if nloc > maxt: reason = f"{nloc} threads per group > {maxt}"
-      elif d.lmem_size > 32768: reason = "local memory"
-      elif any(not self.owns(img.addr) for img in d.textures + d.ibos): reason = "image outside the arena"
-      elif any(k >= len(d.samplers) or not d.samplers[k] for k in samps): reason = "sampler"
-    if reason is not None:
-      self.fallback_reasons[reason] = self.fallback_reasons.get(reason, 0) + 1
-      self.stats["cpu"] += 1
-      self.sync()
-      return False
+    if isinstance(p, Unsupported): return str(p)
+    pso, tables, maxt, _, samps, imbuf = p
+    nloc = math.prod(d.local_size)
+    if nloc > maxt: return f"{nloc} threads per group > {maxt}"
+    if d.lmem_size > 32768: return "local memory"
+    if any(not self.owns(img.addr) for img in d.textures + d.ibos): return "image outside the arena"
+    if any(k >= len(d.samplers) or not d.samplers[k] for k in samps): return "sampler"
     try: xm = self.xmaps(d)
-    except Unsupported as e:
-      self.fallback_reasons[str(e)] = self.fallback_reasons.get(str(e), 0) + 1
-      self.stats["cpu"] += 1
-      self.sync()
-      return False
+    except Unsupported as e: return str(e)
     params = [self.base & 0xFFFFFFFF, self.base >> 32, self.size & 0xFFFFFFFF, self.size >> 32, len(xm), 0, 0, 0]
     for img in d.textures + d.ibos:
       off = img.addr - self.base
       params += [off & 0xFFFFFFFF, off >> 32, img.width, img.height, img.pitch // img.dtype.itemsize]
-    enc = self.encoder()
-    poff = self.upload(struct.pack(f"{len(params)}I", *params))
-    coff = self.upload(d.consts.astype(np.uint32).tobytes())
-    xdata = b"".join(struct.pack("QQQQ", lo, hi, buf.gpuAddress() + (lo - blo), 0) for lo, hi, buf, blo in xm) or bytes(32)
+    return pso, tables, imbuf, struct.pack(f"{len(params)}I", *params), xm, self.xdata
+
+  def run(self, d:emu.Dispatch) -> bool:
+    if (m := self.dmemo.get(id(d))) is not None and m[0] is d: prep = m[1]
+    else:
+      prep = self.prepare(d)
+      if len(self.dmemo) > 65536: self.dmemo.clear()
+      self.dmemo[id(d)] = (d, prep)
+    if isinstance(prep, str):
+      self.fallback_reasons[prep] = self.fallback_reasons.get(prep, 0) + 1
+      self.stats["cpu"] += 1
+      self.sync()
+      return False
+    pso, tables, imbuf, pbytes, xm, xdata = prep
+    e = self.encoder().value
+    consts = np.ascontiguousarray(d.consts, np.uint32)
+    poff = self.upload(pbytes)
+    coff = self.upload_ptr(consts.ctypes.data, consts.nbytes)
     xoff = self.upload(xdata)
-    enc.setComputePipelineState(pso)
-    enc.setBuffer_offset_atIndex(self.arena, 0, 0)
-    enc.setBuffer_offset_atIndex(self.scratch, coff, 1)
-    enc.setBuffer_offset_atIndex(self.scratch, poff, 2)
-    enc.setBuffer_offset_atIndex(self.scratch, xoff, 3)
-    enc.setBuffer_offset_atIndex(imbuf, 0, 28)
-    for _, _, buf, _ in xm: enc.useResource_usage(self.metal.MTLResource(buf.value), 3)  # host memory wrapped as an MTLBuffer; the binding takes MTLResource
-    for n in tables: enc.setBuffer_offset_atIndex(self.table(n), 0, 4 + TABLES.index(n))
+    if self.est.get("pso") is not pso: self.f_pso(e, pso.value); self.est["pso"] = pso
+    self.f_offset(e, coff, 1)
+    self.f_offset(e, poff, 2)
+    self.f_offset(e, xoff, 3)
+    if self.est.get("imbuf") is not imbuf: self.f_buffer(e, imbuf.value, 0, 28); self.est["imbuf"] = imbuf
+    for _, _, buf, _ in xm:
+      if buf.value not in self.est["used"]: self.f_use(e, buf.value, 3); self.est["used"].add(buf.value)
+    for n in tables:
+      if n not in self.est["tables"]: self.f_buffer(e, self.table(n).value, 0, 4 + TABLES.index(n)); self.est["tables"].add(n)
     m = self.metal
-    enc.dispatchThreadgroups_threadsPerThreadgroup(m.MTLSize(*d.groups), m.MTLSize(*d.local_size))
-    enc.memoryBarrierWithScope(m.MTLBarrierScopeBuffers)
+    self.f_dispatch(e, m.MTLSize(*d.groups), m.MTLSize(*d.local_size))
+    self.f_barrier(e, m.MTLBarrierScopeBuffers)
     self.stats["metal"] += 1
     self.ndisp += 1
     if self.ndisp >= getenv("QCOM_METAL_BATCH", 8): self.flush()
