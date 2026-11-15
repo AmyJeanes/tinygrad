@@ -2073,6 +2073,7 @@ mad.f16|h
 mad.f16|mix
 mad.f32
 mad.f32|(neg)
+mad.f32|(neg)|mix
 mad.f32|(sat)|(neg)
 mad.f32|mix
 mad.s16|(neg)|h
