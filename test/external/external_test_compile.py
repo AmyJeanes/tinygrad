@@ -161,6 +161,48 @@ class TestCompile(unittest.TestCase):
       d = np.minimum.reduce([nx, src.width - nx, ny, src.height - ny]) * lenses["os_narrow"]["f"] / lenses["ar_ox_narrow"]["f"]
       assert_close(alpha, np.where(n_ok, np.round(np.clip(d / feather, 0, 1) * 255), 0), ~(n_edge & (z > 0)))
 
+  def test_reproject_stage(self):
+    from tinygrad import Tensor
+    from examples.openpilot.compile_warp import NV12Frame
+    from examples.openpilot.compile_reproject_tables import nv12_body
+    from examples.openpilot.compile_reproject_stage import make_stage
+    src, dst = NV12Frame(16, 12, 20, 14, 7, 512), NV12Frame(12, 8, 16, 10, 5, 280)
+    knots, uv_fill, k, mask, shift, invalid = [16.0, 100.0, 237.0], 128, 3, (1 << 9) - 1, 9, 1 << 17
+    stage = make_stage(src, dst, knots, uv_fill, idx_mask=mask, alpha_shift=shift, invalid_bit=invalid)
+    rng = np.random.default_rng(0)
+    wide, narrow = (rng.integers(0, 256, src.size, dtype=np.uint8) for _ in range(2))
+    gains = np.r_[[-40.0, 90.0, 300.0], rng.normal(0, 0.05, 5), rng.normal(0, 5, 5), [0.5, 1.0, 1.6], rng.normal(0, 3, 6),
+                  [-0.8, 0.9, -0.7, 0.6]].astype(np.float32)
+    n, body = nv12_body(dst), nv12_body(src)
+    pw_wide, pw_narrow = (rng.integers(0, body, n) + (rng.integers(0, 256, n) << shift) + (rng.random(n) < 0.1) * invalid for _ in range(2))
+    pw_narrow[:4] = pw_narrow[:4] & mask | (np.array([0, 255, 0, 255]) << shift)  # the inset's ends: all wide, all narrow
+    pw_wide[4] = pw_narrow[4] = invalid  # the bare invalid bit
+    pn = rng.integers(0, body, n)
+    out_w, planes = stage(Tensor(wide), Tensor(narrow), Tensor(gains), *(Tensor(t.astype(np.int32)) for t in (pw_wide, pw_narrow, pn)))
+
+    i = np.arange(n)
+    chroma = i >= dst.stride * dst.y_height
+    np.testing.assert_array_equal(out_w.numpy(), np.where(pw_wide < invalid, wide[pw_wide & mask], chroma * uv_fill))
+    def pwl(v, g): return g[0] + sum((g[j] - g[j-1]) * np.clip((v - knots[j-1]) / (knots[j] - knots[j-1]), 0, 1) for j in range(1, k))
+    idx = pw_narrow & mask
+    w, a = wide[idx].astype(np.float64), ((pw_narrow >> shift) & 0xff) / 255
+    row = np.where(chroma, (i // dst.stride - dst.y_height) * 2, i // dst.stride)
+    x = np.clip(i % dst.stride * 2 / dst.width - 1, gains[2*k+16], gains[2*k+17])
+    y = np.clip(row * 2 / dst.height - 1, gains[2*k+18], gains[2*k+19])
+    q = np.stack([x, y, x * y, x * x, y * y])
+    luma = pwl(w, gains[:k]) + w * (gains[k:k+5] @ q) + gains[k+5:k+10] @ q
+    rel = np.where(idx >= (src_uv := src.stride * src.y_height), idx - src_uv, 0)
+    y_under = wide[rel // src.stride * 2 * src.stride + (rel % src.stride & ~1)].astype(np.float64)
+    o, u = 2 * k + 10, i % 2 == 0
+    color = ((w - uv_fill) * pwl(y_under, gains[k+10:2*k+10]) + uv_fill + np.where(u, gains[o], gains[o+1]) +
+             np.where(u, gains[o+2], gains[o+3]) * x + np.where(u, gains[o+4], gains[o+5]) * y)
+    matched = np.where(pw_narrow < invalid, np.clip(np.where(chroma, color, luma), 0, 255), chroma * uv_fill)
+    expected = np.round(a * narrow[pn & mask] + (1 - a) * matched)
+    # float32 on the device against float64 here: a byte at a rounding boundary may land either side
+    diff = np.abs(np.concatenate([p.numpy() for p in planes]) - expected)
+    self.assertLessEqual(diff.max(), 1)
+    self.assertGreater((diff == 0).mean(), 0.99)
+
 
 @unittest.skipUnless(getenv("MODEL_PKL", ""), "requires an artifact from python examples/openpilot/compile_onnx.py")
 class TestCompiledModel(unittest.TestCase):
